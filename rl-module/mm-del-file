@@ -1,0 +1,193 @@
+#!/usr/bin/perl -w
+
+use warnings;
+use strict;
+use POSIX;
+
+sub usage
+{
+  die qq{Usage: $0 [filename]\n};
+}
+
+if ( scalar @ARGV > 1 ) {
+  usage;
+}
+
+my $first_timestamp = undef;
+my $last_timestamp = undef;
+my $base_timestamp = undef;
+my $delay_pre = 0;
+my $timestamp = 0;
+my $timestamp_pre = 0;
+my @delays;
+my %signal_delay;
+my $points;
+my $filename = $ARGV[0];
+#print "filename: $filename\n";
+open(my $delay_fh, '>', "$filename.dat");
+#print "filename: $filename\n";
+open(my $jitter_fh, '>', "$filename-jitter.dat");
+#die {$!};
+
+LINE: while ( <> ) {
+  chomp;
+
+  if ( m{^# base timestamp: (\d+)} ) {
+    if ( defined $base_timestamp ) {
+      die "base timestamp multiply defined";
+    } else {
+      $base_timestamp = $1;
+    }
+    next LINE;
+  } elsif ( m{^#} ) {
+    next LINE;
+  }
+
+  # parse and validate line
+  my ( $timestamp, $event_type, $num_bytes, $delay ) = split /\s+/, $_;
+
+  if ( not defined $num_bytes ) {
+    die q{Format: timestamp event_type num_bytes [delay]};
+  }
+
+  if ( $timestamp !~ m{^\d+$} ) {
+    die qq{Invalid timestamp: $timestamp};
+  }
+
+  if ( $num_bytes !~ m{^\d+$} ) {
+    die qq{Invalid byte count: $num_bytes};
+  }
+
+  if ( not defined $base_timestamp ) {
+    die "logfile is missing base timestamp";
+  }
+
+  $timestamp -= $base_timestamp; # correct for startup time variation
+    
+    if ( $timestamp > 0) {
+#        $timestamp -= 30000; # correct for startup time variation
+
+      if ( not defined $last_timestamp ) {
+        $last_timestamp = $first_timestamp = $timestamp;
+      }
+
+      $last_timestamp = max( $timestamp, $last_timestamp );
+
+      # process the event
+      if ( $event_type eq q{-} ) {
+        if ( not defined $delay ) {
+          die q{Departure format: timestamp - num_bytes delay};
+        }
+        push @delays, $delay;
+        $signal_delay{ $timestamp - $delay } = min( $delay, $signal_delay{ $timestamp - $delay } );
+        $points .= ($timestamp - $delay) / 1000.0 . " $delay\n";
+        my $tt=($timestamp - $delay) / 1000.0;
+        my $timestamp_tmp=$timestamp-$timestamp_pre;
+        if ( $timestamp_tmp > 0 ) {
+            my $jitter_t=($timestamp_tmp/2+$timestamp_pre)/1000;
+            my $jitter=($delay-$delay_pre); #/$timestamp_tmp;
+            $timestamp_pre=$timestamp;
+            $delay_pre=$delay;
+            print $delay_fh qq{$tt $delay\n};
+            print $jitter_fh qq{$jitter_t $jitter\n};
+        }
+      }
+  }
+}
+
+sub max {
+  my $maxval = - POSIX::DBL_MAX;
+
+  for ( @_ ) {
+    next unless defined $_;
+    if ( $_ > $maxval ) {
+      $maxval = $_;
+    }
+  }
+
+  return $maxval;
+}
+
+sub min {
+  my $minval = POSIX::DBL_MAX;
+
+  for ( @_ ) {
+    next unless defined $_;
+    if ( $_ < $minval ) {
+      $minval = $_;
+    }
+  }
+
+  return $minval;
+}
+
+# calculate statistics
+if ( scalar @delays == 0 ) {
+  die q{Must have at least one departure event};
+}
+
+@delays = sort { $a <=> $b } @delays;
+
+my $pp95 = $delays[ 0.95 * scalar @delays ];
+
+my $pp50 = $delays[ 0.5 * scalar @delays ];
+
+# measure signal delay every millisecond
+# = minimum time for a message created at time t to get to receiver
+my @signal_delay_samples = sort { $a <=> $b } keys %signal_delay;
+
+for ( my $ts = $signal_delay_samples[ -1 ]; $ts >= $signal_delay_samples[ 0 ]; $ts-- ) {
+  if ( not defined $signal_delay{ $ts } ) {
+    $signal_delay{ $ts } = $signal_delay{ $ts + 1 } + 1;
+  }
+}
+
+my $signal_delay_points;
+for ( my $ts = $signal_delay_samples[ 0 ]; $ts <= $signal_delay_samples[ -1 ]; $ts++ ) {
+  $signal_delay_points .= $ts / 1000.0 . " " . $signal_delay{ $ts } . "\n";
+}
+my $size_=@delays;
+my $sum=0;
+for ( my $i =0 ; $i < $size_; $i++ ) {
+    $sum=$sum+$delays[$i];
+}
+my $avg=$sum/$size_;
+
+my @signal_delays = sort { $a <=> $b } values %signal_delay;
+my $pp95s = $signal_delays[ 0.95 * scalar @signal_delays ];
+
+printf STDERR qq{average per packet delay: %.0f ms\n}, $avg;
+printf STDERR qq{95th percentile per-packet queueing delay: %.0f ms\n}, $pp95;
+printf STDERR qq{95th percentile signal delay: %.0f ms\n}, $pp95s;
+
+my $graph_max = $signal_delays[-1] * 1.2;
+
+# make graph
+open GNUPLOT, q{| gnuplot} or die;
+
+my $lower_limit = min( 30, int $pp50 );
+
+print GNUPLOT <<END;
+set xlabel "time (s)"
+set ylabel "delay (ms)
+set logscale y
+#set yrange [$lower_limit:$graph_max]
+set ytics add ($lower_limit)
+set grid xtics lc rgb "#bbbbbb" lw 1 lt 0
+set key center outside top horizontal
+set terminal svg size 1024,514 fixed enhanced font "Arial,12" solid mouse standalone name "Delay"
+set output "/dev/stdout"
+END
+
+#printf GNUPLOT qq{plot [%f:%f] "-" using 1:2 title "Per-packet delay" with points lt  ps 0.5 lc rgb "#00ff0000", %f with lines lw 3 lc rgb "#80ff0000" title "95th percentile per-packet delay (%.0f ms)",  %f with lines lw 5 lc rgb "#8000ff00" title "average per-packet delay (%.0f ms)"\n}, $first_timestamp / 1000.0, $last_timestamp / 1000.0, $pp95, $pp95, $avg, $avg;
+
+#printf GNUPLOT qq{plot [%f:%f] "-" using 1:2 title "Signal delay" with filledcurves above x1 lt 1 fs solid 0.01 noborder fc rgb "#000010", "-" using 1:2 title "Per-packet delay" with points lt 2 ps 0.5 lc rgb "#00ff0000", %f with lines lw 2 lc rgb "#800000ff" title "95th percentile signal delay (%.0f ms)", %f with lines lw 3 lc rgb "#80ff0000" title "95th percentile per-packet delay (%.0f ms)",  %f with lines lw 5 lc rgb "#8000ff00" title "average per-packet delay (%.0f ms)"\n}, $first_timestamp/1000,$last_timestamp/1000 , $pp95s, $pp95s, $pp95, $pp95, $avg, $avg;
+#printf GNUPLOT qq{plot [%f:%f] "-" using 1:2 title "Signal delay" with filledcurves above x1 lt 1 fs solid 0.01 noborder fc rgb "#000010", "-" using 1:2 title "Per-packet delay" with points lt 2 ps 1 lc rgb "#00ff0000", %f with lines lw 2 lc rgb "#800000ff" title "95th percentile signal delay (%.0f ms)", %f with lines lw 3 lc rgb "#80ff0000" title "95th percentile per-packet delay (%.0f ms)",  %f with lines lw 5 lc rgb "#8000ff00" title "average per-packet delay (%.0f ms)"\n}, $first_timestamp / 1000.0, $last_timestamp / 1000.0, $pp95s, $pp95s, $pp95, $pp95, $avg, $avg;
+#printf GNUPLOT qq{plot [%f:%f] "-" using 1:2 title "Signal delay" with filledcurves above x1 lt 1 fs solid 0.4 noborder fc rgb "#0000ff", "-" using 1:2 title "Per-packet delay" with points lt 3 ps 0.15 lc rgb "#00ff0000", %f with lines lw 2 lc rgb "#800000ff" title "95th percentile signal delay (%.0f ms)", %f with lines lw 3 lc rgb "#80ff0000" title "95th percentile per-packet delay (%.0f ms)",  %f with lines lw 5 lc rgb "#8000ff00" title "average per-packet delay (%.0f ms)"\n}, $first_timestamp / 1000.0, $last_timestamp / 1000.0, $pp95s, $pp95s, $pp95, $pp95, $avg, $avg;
+
+#print GNUPLOT $signal_delay_points;
+#print GNUPLOT "e\n";
+#print GNUPLOT $points;
+close $delay_fh;
+close $jitter_fh;
+#close GNUPLOT or die qq{$!};

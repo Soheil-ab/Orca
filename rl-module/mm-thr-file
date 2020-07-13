@@ -1,0 +1,217 @@
+#!/usr/bin/perl -w
+
+use warnings;
+use strict;
+use POSIX;
+
+sub usage
+{
+  die qq{Usage: $0 MS_PER_BIN [filename]\n};
+}
+
+if ( scalar @ARGV < 1 or scalar @ARGV > 2 ) {
+  usage;
+}
+
+my $MS_PER_BIN = shift;
+
+if ( $MS_PER_BIN !~ m{^\d+$} ) {
+  usage;
+}
+
+sub ms_to_bin {
+  return int( $_[0] / $MS_PER_BIN );
+}
+
+sub bin_to_seconds {
+  return sprintf q{%.3f}, $_[0] * $MS_PER_BIN / 1000.0;
+}
+
+my ( %capacity, %arrivals, %departures );
+
+my $first_timestamp = undef;
+my $last_timestamp = undef;
+my $base_timestamp = undef;
+my $capacity_sum;
+my $arrival_sum;
+my $departure_sum;
+my @delays;
+my %signal_delay;
+my $filename = $ARGV[0];
+open(my $thr_fh, '>', "$filename-thr.dat");
+
+LINE: while ( <> ) {
+  chomp;
+
+  if ( m{^# base timestamp: (\d+)} ) {
+    if ( defined $base_timestamp ) {
+      die "base timestamp multiply defined";
+    } else {
+      $base_timestamp = $1;
+    }
+    next LINE;
+  } elsif ( m{^#} ) {
+    next LINE;
+  }
+
+  # parse and validate line
+  my ( $timestamp, $event_type, $num_bytes, $delay ) = split /\s+/, $_;
+
+  if ( not defined $num_bytes ) {
+    die q{Format: timestamp event_type num_bytes [delay]};
+  }
+
+  if ( $timestamp !~ m{^\d+$} ) {
+    die qq{Invalid timestamp: $timestamp};
+  }
+
+  if ( $num_bytes !~ m{^\d+$} ) {
+    die qq{Invalid byte count: $num_bytes};
+  }
+
+  if ( not defined $base_timestamp ) {
+    die "logfile is missing base timestamp";
+  }
+
+  $timestamp -= $base_timestamp; # correct for startup time variation
+  if ( $timestamp > 0 ) {
+#      $timestamp -= 30000; # correct for startup time variation
+    
+      if ( not defined $last_timestamp ) {
+        $last_timestamp = $first_timestamp = $timestamp;
+      }
+
+      $last_timestamp = max( $timestamp, $last_timestamp );
+
+
+      my $num_bits = $num_bytes * 8;
+      my $bin = ms_to_bin( $timestamp );
+
+      # process the event
+      if ( $event_type eq q{+} ) {
+        $arrivals{ $bin } += $num_bits;
+        $arrival_sum += $num_bits;
+      } elsif ( $event_type eq q{d} ) {
+          ; #noothing for now! We have drop!
+      } elsif ( $event_type eq q{#} ) {
+        $capacity{ $bin } += $num_bits;
+        $capacity_sum += $num_bits;
+      } elsif ( $event_type eq q{-} ) {
+        if ( not defined $delay ) {
+          die q{Departure format: timestamp - num_bytes delay};
+        }
+        $departures{ $bin } += $num_bits;
+
+        if ( $delay < 0 ) {
+        die qq{Invalid delay: $delay};
+        }
+
+        if ( $timestamp - $delay < 0 ) {
+        die qq{Invalid timestamp and delay: ts=$timestamp, delay=$delay};
+        }
+
+        push @delays, $delay;
+        $departure_sum += $num_bits;
+
+        $signal_delay{ $timestamp - $delay } = min( $delay,
+                            (defined $signal_delay{ $timestamp - $delay })
+                            ? $signal_delay{ $timestamp - $delay }
+                            : POSIX::DBL_MAX );
+      } else {
+        die qq{Unknown event type: $event_type};
+      }
+  }
+}
+
+sub min {
+  my $minval = POSIX::DBL_MAX;
+
+  for ( @_ ) {
+    if ( $_ < $minval ) {
+      $minval = $_;
+    }
+  }
+
+  return $minval;
+}
+
+sub max {
+  my $maxval = - POSIX::DBL_MAX;
+
+  for ( @_ ) {
+    if ( $_ > $maxval ) {
+      $maxval = $_;
+    }
+  }
+
+  return $maxval;
+}
+
+if ( not defined $first_timestamp ) {
+    die q{Must have at least one event};
+}
+
+# calculate statistics
+my $duration = ($last_timestamp - $first_timestamp) / 1000.0;
+my $average_capacity = ($capacity_sum / $duration) / 1000000.0;
+my $average_ingress = ($arrival_sum / $duration) / 1000000.0;
+my $average_throughput = ($departure_sum / $duration) / 1000000.0;
+
+if ( scalar @delays == 0 ) {
+  die q{Must have at least one departure event};
+}
+
+@delays = sort { $a <=> $b } @delays;
+
+my $pp95 = $delays[ 0.95 * scalar @delays ];
+my $pp99 = $delays[ 0.99 * scalar @delays ];
+my $pp50 = $delays[ 0.50 * scalar @delays ];
+
+# measure signal delay every millisecond
+# = minimum time for a message created at time t to get to receiver
+my @signal_delay_samples = sort { $a <=> $b } keys %signal_delay;
+
+for ( my $ts = $signal_delay_samples[ -1 ]; $ts >= $signal_delay_samples[ 0 ]; $ts-- ) {
+  if ( not defined $signal_delay{ $ts } ) {
+    $signal_delay{ $ts } = $signal_delay{ $ts + 1 } + 1;
+  }
+}
+
+my @signal_delays = sort { $a <=> $b } values %signal_delay;
+my $pp95s = $signal_delays[ 0.95 * scalar @signal_delays ];
+my $size_=@delays;
+my $sum=0;
+for ( my $i =0 ; $i < $size_; $i++ ) {
+    $sum=$sum+$delays[$i];
+}
+my $avg=$sum/$size_;
+
+# make graph
+my $earliest_bin = min( keys %arrivals, keys %capacity, keys %departures );
+my $latest_bin = max( keys %arrivals, keys %capacity, keys %departures );
+
+if ( $earliest_bin == $latest_bin ) {
+  die q{MS_PER_BIN is too large for length of trace};
+}
+
+my $current_buffer_occupancy = 0;
+
+sub default {
+  return defined $_[ 0 ] ? $_[ 0 ] : 0;
+}
+
+for ( my $bin = $earliest_bin; $bin <= $latest_bin; $bin++ ) {
+    my $t = bin_to_seconds( $bin );
+    my ( $cap, $arr, $dep ) = map { (default $_) / ($MS_PER_BIN / 1000.0) / 1000000.0 } ( $capacity{ $bin }, $arrivals{ $bin }, $departures{ $bin } );
+
+    $current_buffer_occupancy += default $arrivals{ $bin };
+    $current_buffer_occupancy -= default $departures{ $bin };
+
+    print $thr_fh qq{$t $cap $arr $dep $current_buffer_occupancy\n};
+
+}
+
+close $thr_fh or die qq{$!};
+
+
+
