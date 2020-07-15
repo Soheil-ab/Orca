@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en-us">
+  <head>
+    <meta charset="UTF-8">
+    <title>Orca by Soheil-ab</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="stylesheet" type="text/css" href="stylesheets/normalize.css" media="screen">
+    <link href='https://fonts.googleapis.com/css?family=Open+Sans:400,700' rel='stylesheet' type='text/css'>
+    <link rel="stylesheet" type="text/css" href="stylesheets/stylesheet.css" media="screen">
+    <link rel="stylesheet" type="text/css" href="stylesheets/github-light.css" media="screen">
+  </head>
+  <body>
+    <section class="page-header">
+      <h1 class="project-name">Orca</h1>
+      <h2 class="project-tagline">Orca: Towards Mastering Congestion Control In the Internet</h2>
+      <a href="https://github.com/Soheil-ab/Orca" class="btn">View on GitHub</a>
+      <a href="https://github.com/Soheil-ab/Orca/zipball/master" class="btn">Download .zip</a>
+      <a href="https://github.com/Soheil-ab/Orca/tarball/master" class="btn">Download .tar.gz</a>
+    </section>
+
+    <section class="main-content">
+      <h1>
+<a id="orca-v10" class="anchor" href="#orca-v10" aria-hidden="true"><span aria-hidden="true" class="octicon octicon-link"></span></a>Orca v1.0</h1>
+<p>This release presents the source code and materials used for the experiments in our SIGCOMM'20 paper: "Classic Meets Modern: A Pragmatic Learning-Based Congestion Control for the Internet".</p>
+<h1>
+<a id="installation-guide" class="anchor" href="#installation-guide" aria-hidden="true"><span aria-hidden="true" class="octicon octicon-link"></span></a>Installation Guide</h1>
+<h3>
+<a id="installing-required-tools" class="anchor" href="#installing-required-tools" aria-hidden="true"><span aria-hidden="true" class="octicon octicon-link"></span></a>Installing Required Tools</h3>
+<p>Install Mahimahi (<a href="http://mahimahi.mit.edu/#getting">http://mahimahi.mit.edu/#getting</a>)</p>
+<pre><code>```sh  
+sudo apt-get install build-essential git debhelper autotools-dev dh-autoreconf iptables protobuf-compiler libprotobuf-dev pkg-config libssl-dev dnsmasq-base ssl-cert libxcb-present-dev libcairo2-dev libpango1.0-dev iproute2 apache2-dev apache2-bin iptables dnsmasq-base gnuplot iproute2 apache2-api-20120211 libwww-perl
+git clone https://github.com/ravinet/mahimahi 
+cd mahimahi
+./autogen.sh &amp;&amp; ./configure &amp;&amp; make
+sudo make install
+sudo sysctl -w net.ipv4.ip_forward=1
+```
+</code></pre>
+<h3>
+<a id="orcas-drl-agent" class="anchor" href="#orcas-drl-agent" aria-hidden="true"><span aria-hidden="true" class="octicon octicon-link"></span></a>Orca's DRL Agent</h3>
+<h4>
+<a id="prerequisites" class="anchor" href="#prerequisites" aria-hidden="true"><span aria-hidden="true" class="octicon octicon-link"></span></a>Prerequisites</h4>
+<ul>
+<li>Python &gt;= 3.4</li>
+<li>Tensorflow 1.14.0</li>
+</ul>
+<h5>
+<a id="create-a-virtul-environment" class="anchor" href="#create-a-virtul-environment" aria-hidden="true"><span aria-hidden="true" class="octicon octicon-link"></span></a>Create a virtul environment</h5>
+<pre><code>mkdir ~/venv
+sudo apt update
+sudo apt install python3-pip
+sudo pip3 install -U virtualenv
+virtualenv ~/venv -p python3
+</code></pre>
+<p>If you change the path of the virtual environment, you need to change the source code accordingly. The source code assumes that virtual environment is set @ ~/venv .</p>
+<h5>
+<a id="install-packages" class="anchor" href="#install-packages" aria-hidden="true"><span aria-hidden="true" class="octicon octicon-link"></span></a>Install packages</h5>
+<pre><code>source ~/venv/bin/activate
+pip install --upgrade pip
+pip install gym
+pip install tensorflow==1.14
+pip install sysv_ipc
+</code></pre>
+<p>Verify Installation</p>
+<pre><code>python -c "import tensorflow as tf; tf.enable_eager_execution(); print(tf.reduce_sum(tf.random_normal([1000, 1000])))"
+</code></pre>
+<p>To deactivate venv</p>
+<pre><code>(venv) $ deactivate
+</code></pre>
+<h3>
+<a id="patching-orca-kernel-install-the-prepared-debian-packages" class="anchor" href="#patching-orca-kernel-install-the-prepared-debian-packages" aria-hidden="true"><span aria-hidden="true" class="octicon octicon-link"></span></a>Patching Orca Kernel: Install the prepared debian packages.</h3>
+<pre><code>cd linux
+sudo dpkg -i linux-image*
+sudo dpkg -i linux-header*
+sudo reboot 
+</code></pre>
+<h3>
+<a id="verify-the-new-kernel" class="anchor" href="#verify-the-new-kernel" aria-hidden="true"><span aria-hidden="true" class="octicon octicon-link"></span></a>Verify the new kernel</h3>
+<p>Use the following command to make sure that new kernel is installed:</p>
+<pre><code>uname -r
+</code></pre>
+<p>The output should be 4.13.1-0521*. If not you need to bring the 4.13.1-0521* Kernel image on top of the grub list. For instance, you can use grub-customizer application. Install the grub-customizer using following:</p>
+<pre><code>sudo add-apt-repository ppa:danielrichter2007/grub-customizer
+sudo apt-get update
+sudo apt-get install grub-customizer
+sudo grub-customizer
+</code></pre>
+<h3>
+<a id="build-orcas-server-client-apps" class="anchor" href="#build-orcas-server-client-apps" aria-hidden="true"><span aria-hidden="true" class="octicon octicon-link"></span></a>Build Orca's Server-Client Apps</h3>
+<p>To build the required applications, run the following:</p>
+<pre><code>./build.sh
+</code></pre>
+<p>This release includes two versions: A standalone actor version and an actor-learner version.
+In the Standalone actor version, no learner will be initiated. This can be usefull when you simply wanna test the current model over an emulated link. However, the actor-learner version requires a learner being initiated before any actor can be started. The second mode is usefull for learning a new/better model and also, it still can be used for performing a simple test over emulated links.</p>
+<h3>
+<a id="run-a-sample-test-with-the-standalone-version-using-the-provided-learned-model" class="anchor" href="#run-a-sample-test-with-the-standalone-version-using-the-provided-learned-model" aria-hidden="true"><span aria-hidden="true" class="octicon octicon-link"></span></a>Run a Sample Test with the standalone version using the provided learned model</h3>
+<pre><code>./orca-standalone-emulation.sh 44444
+</code></pre>
+<h3>
+<a id="run-a-sample-test-with-the-acotr-learner-version-using-the-provided-learned-model" class="anchor" href="#run-a-sample-test-with-the-acotr-learner-version-using-the-provided-learned-model" aria-hidden="true"><span aria-hidden="true" class="octicon octicon-link"></span></a>Run a Sample Test with the acotr-learner version using the provided learned model</h3>
+<pre><code>./orca.sh 4 44444
+</code></pre>
+<p>Results will be generated automatically in rl-module/log/*
+You can check out the summary of results at rl-module/log/sum-*</p>
+<h3>
+<a id="some-notes-on-the-training" class="anchor" href="#some-notes-on-the-training" aria-hidden="true"><span aria-hidden="true" class="octicon octicon-link"></span></a>Some notes on the training:</h3>
+<ol>
+<li>To distribute the actors over remote servers, you need to change "learner_ip" and "actor_ip" fields of the params.json file to the corresponding server IPs.</li>
+<li>Start the learner first.</li>
+<li>Set <code>remote:true</code> when using remote servers.</li>
+<li>Set <code>num_actors: N</code>, N is the number of actors.</li>
+</ol>
+<h3>
+<a id="cellular-traces" class="anchor" href="#cellular-traces" aria-hidden="true"><span aria-hidden="true" class="octicon octicon-link"></span></a>Cellular traces:</h3>
+<p>To use traces avaialbe @ <a href="https://github.com/Soheil-ab/Cellular-Traces-NYC">https://github.com/Soheil-ab/Cellular-Traces-NYC</a> , copy them to the traces folder of the project.</p>
+
+      <footer class="site-footer">
+        <span class="site-footer-owner"><a href="https://github.com/Soheil-ab/Orca">Orca</a> is maintained by <a href="https://github.com/Soheil-ab">Soheil-ab</a>.</span>
+
+        <span class="site-footer-credits">This page was generated by <a href="https://pages.github.com">GitHub Pages</a> using the <a href="https://github.com/jasonlong/cayman-theme">Cayman theme</a> by <a href="https://twitter.com/jasonlong">Jason Long</a>.</span>
+      </footer>
+
+    </section>
+
+  
+  </body>
+</html>
