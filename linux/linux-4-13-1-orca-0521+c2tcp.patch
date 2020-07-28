@@ -1,0 +1,1268 @@
+diff -rpuN -x '.*' linux-4.13.1-base/include/linux/tcp.h linux-4.13.1-pure-bbr/include/linux/tcp.h
+--- linux-4.13.1-base/include/linux/tcp.h	2017-09-10 01:45:52.000000000 -0400
++++ linux-4.13.1-pure-bbr/include/linux/tcp.h	2020-07-28 14:51:52.880123400 -0400
+@@ -136,6 +136,7 @@ struct tcp_request_sock {
+ 						  */
+ };
+ 
++
+ static inline struct tcp_request_sock *tcp_rsk(const struct request_sock *req)
+ {
+ 	return (struct tcp_request_sock *)req;
+@@ -370,6 +371,41 @@ struct tcp_sock {
+ 	 * socket. Used to retransmit SYNACKs etc.
+ 	 */
+ 	struct request_sock *fastopen_rsk;
++
++	/* DeepCC Params*/
++	u8	deepcc_enable;		/*1 => Only enable periodic reports and setting cwnd. */
++							/*2 => (above) + enable deepcc pacing rate calculation*/
++	struct {
++		u32 min_urtt;
++		u32 avg_urtt;
++		u32 cnt;
++		u64	avg_thr;		/* average throughput */
++		u32	thr_cnt;		/* Number of sampled throughput for averaging it*/
++		u32 pre_lost;		/* Total Number of Previously lost packets*/
++	} deepcc_api;
++
++	/* Orca: min. cwnd*/
++	u32  cwnd_min;
++
++	/* C2TCP Parameters */
++	u32 first_above_time;
++	u32 next_time;
++	u32 cnt_rtt;
++	u16 rec_inv_sqrt;
++	u32 c2tcp_min_urtt;
++	u32 c2tcp_avg_urtt;
++	u32 c2tcp_cnt;
++	u64	c2tcp_avg_thr;		/* average throughput */
++	u32	c2tcp_thr_cnt;		/* Number of sampled throughput for averaging it*/
++	/**
++	 * Accessible settings (to Applications):
++	 */
++	u8  c2tcp_enable;
++	u32 c2tcp_alpha;
++//	u32 c2tcp_setpoint;
++//	u32 c2tcp_interval;
++	/*END of C2TCP*/
++
+ 	u32	*saved_syn;
+ };
+ 
+diff -rpuN -x '.*' linux-4.13.1-base/include/net/tcp.h linux-4.13.1-pure-bbr/include/net/tcp.h
+--- linux-4.13.1-base/include/net/tcp.h	2017-09-10 01:45:52.000000000 -0400
++++ linux-4.13.1-pure-bbr/include/net/tcp.h	2020-01-08 15:09:40.613227400 -0500
+@@ -277,6 +277,36 @@ extern int sysctl_tcp_autocorking;
+ extern int sysctl_tcp_invalid_ratelimit;
+ extern int sysctl_tcp_pacing_ss_ratio;
+ extern int sysctl_tcp_pacing_ca_ratio;
++/*
++* Custom variables for sysctl Params
++*/
++extern unsigned int sysctl_tcp_bbr_enable_app_limited;
++extern unsigned int sysctl_tcp_bbr_enable_lt_bw;
++extern unsigned int sysctl_tcp_bbr_cwnd_rv_gain;
++extern unsigned int sysctl_tcp_bbr_enable_maxdelay;
++extern unsigned int sysctl_tcp_bbr_enable_probertt;
++extern unsigned int sysctl_tcp_bbr_targetdelay;
++extern unsigned int sysctl_bbr_min_rtt_win_sec;
++extern unsigned int sysctl_bbr_probe_rtt_mode_ms;
++extern unsigned int sysctl_tcp_bbr_bw_auto;
++extern unsigned int sysctl_tcp_bbr_bw;
++extern unsigned int sysctl_tcp_bbr_debug;
++extern unsigned int sysctl_tcp_bbr_init_cwnd;
++
++/*
++ * DeepCC
++ *
++ */
++extern int sysctl_tcp_deepcc_enable;
++#define CWND_GAIN_SCALE  100;
++
++/* C2TCP */
++extern int sysctl_tcp_c2tcp_enable;
++/**End*/
++
++/*
++* End of custom variables
++*/
+ 
+ extern atomic_long_t tcp_memory_allocated;
+ extern struct percpu_counter tcp_sockets_allocated;
+@@ -988,6 +1018,14 @@ struct tcp_congestion_ops {
+ 	/* get info for inet_diag (optional) */
+ 	size_t (*get_info)(struct sock *sk, u32 ext, int *attr,
+ 			   union tcp_cc_info *info);
++	/*NATCP*/
++	void (*update_by_app)(struct sock *sk);
++
++	/*C2TCP*/
++	void (*enable_c2tcp)(struct sock *sk, int enable);
++
++	/*RL-C2TCP*/
++	void (*get_rate_sample)(struct sock *sk, const struct rate_sample *rs);
+ 
+ 	char 		name[TCP_CA_NAME_MAX];
+ 	struct module 	*owner;
+@@ -1048,6 +1086,14 @@ static inline void tcp_ca_event(struct s
+ 		icsk->icsk_ca_ops->cwnd_event(sk, event);
+ }
+ 
++/* From tcp_deepcc.c */
++void deepcc_init(struct sock * sk);
++size_t deepcc_get_info(struct sock *sk, u32 ext, int *attr,union tcp_cc_info *info);
++void deepcc_get_rate_sample(struct sock *sk, const struct rate_sample *rs);
++void deepcc_update_cwnd(struct sock *sk);
++void deepcc_pkts_acked(struct sock *sk, const struct ack_sample *sample);
++
++
+ /* From tcp_rate.c */
+ void tcp_rate_skb_sent(struct sock *sk, struct sk_buff *skb);
+ void tcp_rate_skb_delivered(struct sock *sk, struct sk_buff *skb,
+diff -rpuN -x '.*' linux-4.13.1-base/include/uapi/linux/inet_diag.h linux-4.13.1-pure-bbr/include/uapi/linux/inet_diag.h
+--- linux-4.13.1-base/include/uapi/linux/inet_diag.h	2017-09-10 01:45:52.000000000 -0400
++++ linux-4.13.1-pure-bbr/include/uapi/linux/inet_diag.h	2020-01-08 15:09:40.628894400 -0500
+@@ -142,6 +142,8 @@ enum {
+ 	INET_DIAG_PAD,
+ 	INET_DIAG_MARK,
+ 	INET_DIAG_BBRINFO,
++	INET_DIAG_C2TCPINFO,
++	INET_DIAG_DEEPCCINFO,
+ 	__INET_DIAG_MAX,
+ };
+ 
+@@ -184,11 +186,42 @@ struct tcp_bbr_info {
+ 	__u32	bbr_min_rtt;		/* min-filtered RTT in uSec */
+ 	__u32	bbr_pacing_gain;	/* pacing gain shifted left 8 bits */
+ 	__u32	bbr_cwnd_gain;		/* cwnd gain shifted left 8 bits */
++	__u32	bbr_inflight;
++};
++
++/* INET_DIAG_C2TCPINFO */
++
++struct tcp_c2tcp_info {
++	__u32	c2tcp_min_rtt;		/* min-filtered RTT in uSec */
++	__u32	c2tcp_avg_urtt;		/* averaged RTT in uSec from the previous info request till now*/
++	__u32	c2tcp_cnt;		/* number of RTT samples used for averaging */
++	__u64	c2tcp_avg_thr;		/* average throughput Bytes per Sec*/
++	__u32	c2tcp_thr_cnt;		/* Number of sampled throughput for averaging it*/
++};
++
++/* INET_DIAG_DEEPCCINFO */
++struct tcp_deepcc_info {
++	__u32	min_rtt;		/* min-filtered RTT in uSec */
++	__u32	avg_urtt;		/* averaged RTT in uSec from the previous info request till now*/
++	__u32	cnt;		/* number of RTT samples used for averaging */
++	__u64	avg_thr;		/* average throughput Bytes per Sec*/
++	__u32	thr_cnt;		/* Number of sampled throughput for averaging it*/
++	__u32	cwnd;
++	__u32	pacing_rate;
++	__u32	lost_bytes;			/* Number of lost Bytes (from the last monitored phase to now!)*/
++	__u32	srtt_us;	/* smoothed round trip time << 3 in usecs */
++	__u32	snd_ssthresh;	/* Slow start size threshold		*/
++	__u32	packets_out;	/* Packets which are "in flight"	*/
++	__u32	retrans_out;	/* Retransmitted packets out		*/
++	__u32	max_packets_out;  /* max packets_out in last window */
++	__u32 	mss_cache;
+ };
+ 
+ union tcp_cc_info {
+ 	struct tcpvegas_info	vegas;
+ 	struct tcp_dctcp_info	dctcp;
+-	struct tcp_bbr_info	bbr;
++	struct tcp_bbr_info		bbr;
++	struct tcp_c2tcp_info	c2tcp;
++	struct tcp_deepcc_info	deepcc;
+ };
+ #endif /* _UAPI_INET_DIAG_H_ */
+diff -rpuN -x '.*' linux-4.13.1-base/include/uapi/linux/sysctl.h linux-4.13.1-pure-bbr/include/uapi/linux/sysctl.h
+--- linux-4.13.1-base/include/uapi/linux/sysctl.h	2017-09-10 01:45:52.000000000 -0400
++++ linux-4.13.1-pure-bbr/include/uapi/linux/sysctl.h	2020-07-28 14:50:45.561627800 -0400
+@@ -424,6 +424,25 @@ enum
+ 	NET_TCP_ALLOWED_CONG_CONTROL=123,
+ 	NET_TCP_MAX_SSTHRESH=124,
+ 	NET_TCP_FRTO_RESPONSE=125,
++	/* Variable for TCP BBR Target Delay */
++	NET_TCP_BBR_ENABLE_MAXDELAY=126,
++	NET_TCP_BBR_ENABLE_PROBERTT=127,
++	NET_TCP_BBR_TARGETDELAY=128,
++	NET_TCP_BBR_MINRTTWINSEC=129,
++	NET_TCP_BBR_PROBERTTMODEMS=130,
++	NET_TCP_BBR_BW_AUTO=131,
++	NET_TCP_BBR_BW=132,
++	NET_TCP_BBR_DEBUG=133,
++	NET_TCP_BBR_CWND_RV_GAIN=134,
++	NET_TCP_BBR_ENABLE_LT_BW=135,
++	NET_TCP_BBR_ENABLE_APP_LIMITED=136,
++	NET_TCP_BBR_INIT_CWND=136,
++
++	/* Variables for C2TCP*/
++	 NET_TCP_C2TCP_ENABLE=150,
++	/* Variables for DeepCC*/
++	 NET_TCP_DEEPCC=161,
++
+ };
+ 
+ enum {
+diff -rpuN -x '.*' linux-4.13.1-base/include/uapi/linux/tcp.h linux-4.13.1-pure-bbr/include/uapi/linux/tcp.h
+--- linux-4.13.1-base/include/uapi/linux/tcp.h	2017-09-10 01:45:52.000000000 -0400
++++ linux-4.13.1-pure-bbr/include/uapi/linux/tcp.h	2020-07-28 14:52:51.537270200 -0400
+@@ -120,6 +120,34 @@ enum {
+ #define TCP_ULP			31	/* Attach a ULP to a TCP connection */
+ #define TCP_MD5SIG_EXT		32	/* TCP MD5 Signature with extensions */
+ 
++/*
++ * Defining custom Socket TCP Options
++*/
++#define TCP_BBR_EN_MAXDEL 33
++#define TCP_BBR_EN_PRBRTT 34
++#define TCP_BBR_TRGTDEL_US 35
++#define TCP_BBR_MINRTTWIN_SEC 36
++#define TCP_BBR_PRBERTTMDE_MS 37
++#define TCP_BBR_BWAUTO 38
++#define TCP_BBR_BWVAL 39
++#define TCP_BBR_CWNDRVGAIN 40
++#define TCP_BBR_DEBUG 41
++#define TCP_CWND_CLAMP 42
++#define TCP_CWND 43
++#define TCP_DEEPCC_ENABLE 44
++#define TCP_CWND_CAP 45
++
++#define TCP_DEEPCC_INFO		46	/* Get Congestion Control (optional) DeepCC info */
++#define TCP_CWND_MIN		47
++
++/*C2TCP*/
++#define  TCP_C2TCP_ENABLE 50
++#define  TCP_C2TCP_ALPHA 51
++
++/*
++ * End of Custom Socket Defines
++*/
++
+ struct tcp_repair_opt {
+ 	__u32	opt_code;
+ 	__u32	opt_val;
+diff -rpuN -x '.*' linux-4.13.1-base/kernel/sysctl_binary.c linux-4.13.1-pure-bbr/kernel/sysctl_binary.c
+--- linux-4.13.1-base/kernel/sysctl_binary.c	2017-09-10 01:45:52.000000000 -0400
++++ linux-4.13.1-pure-bbr/kernel/sysctl_binary.c	2020-07-28 14:50:41.822468700 -0400
+@@ -391,6 +391,33 @@ static const struct bin_table bin_net_ip
+ 	{ CTL_STR,	NET_TCP_CONG_CONTROL,			"tcp_congestion_control" },
+ 	{ CTL_INT,	NET_TCP_MTU_PROBING,			"tcp_mtu_probing" },
+ 	{ CTL_INT,	NET_TCP_BASE_MSS,			"tcp_base_mss" },
++
++	 /*DeepCC Functionality*/
++	 { CTL_INT,  NET_TCP_DEEPCC,          		"tcp_deepcc" },
++
++	 /*End*/
++
++	 /*C2TCP Functionality*/
++	 { CTL_INT,  NET_TCP_C2TCP_ENABLE,          "tcp_c2tcp_enable" },
++	 /*End*/
++
++	 /*Custom sysctl control params added for BBR*/
++
++	{ CTL_INT,	NET_TCP_BBR_INIT_CWND,				"tcp_bbr_init_cwnd" },
++	{ CTL_INT,	NET_TCP_BBR_ENABLE_APP_LIMITED,		"tcp_bbr_enable_app_limited" },
++	{ CTL_INT,	NET_TCP_BBR_ENABLE_LT_BW,			"tcp_bbr_enable_lt_bw" },
++	{ CTL_INT,	NET_TCP_BBR_CWND_RV_GAIN,			"tcp_bbr_cwnd_rv_gain" },
++	{ CTL_INT,	NET_TCP_BBR_DEBUG,					"tcp_bbr_debug" },
++	{ CTL_INT,	NET_TCP_BBR_ENABLE_MAXDELAY,		"tcp_bbr_enable_maxdelay" },
++	{ CTL_INT,	NET_TCP_BBR_ENABLE_PROBERTT,		"tcp_bbr_enable_probertt" },
++	{ CTL_INT,	NET_TCP_BBR_TARGETDELAY,			"tcp_bbr_targetdelay" },
++	{ CTL_INT,	NET_TCP_BBR_MINRTTWINSEC,			"tcp_bbr_minrttwinsec" },
++	{ CTL_INT,	NET_TCP_BBR_PROBERTTMODEMS,			"tcp_bbr_proberttmodems" },
++	{ CTL_INT,	NET_TCP_BBR_BW,						"tcp_bbr_bw" },
++	{ CTL_INT,	NET_TCP_BBR_BW_AUTO,				"tcp_bbr_bw_auto" },
++	/*
++	* End of custom Params
++	*/
+ 	{ CTL_INT,	NET_IPV4_TCP_WORKAROUND_SIGNED_WINDOWS,	"tcp_workaround_signed_windows" },
+ 	{ CTL_INT,	NET_TCP_SLOW_START_AFTER_IDLE,		"tcp_slow_start_after_idle" },
+ 	{ CTL_INT,	NET_CIPSOV4_CACHE_ENABLE,		"cipso_cache_enable" },
+diff -rpuN -x '.*' linux-4.13.1-base/net/ipv4/Makefile linux-4.13.1-pure-bbr/net/ipv4/Makefile
+--- linux-4.13.1-base/net/ipv4/Makefile	2017-09-10 01:45:52.000000000 -0400
++++ linux-4.13.1-pure-bbr/net/ipv4/Makefile	2020-01-08 15:09:40.669186900 -0500
+@@ -9,6 +9,7 @@ obj-y     := route.o inetpeer.o protocol
+ 	     tcp.o tcp_input.o tcp_output.o tcp_timer.o tcp_ipv4.o \
+ 	     tcp_minisocks.o tcp_cong.o tcp_metrics.o tcp_fastopen.o \
+ 	     tcp_rate.o tcp_recovery.o tcp_ulp.o \
++	     tcp_deepcc.o \
+ 	     tcp_offload.o datagram.o raw.o udp.o udplite.o \
+ 	     udp_offload.o arp.o icmp.o devinet.o af_inet.o igmp.o \
+ 	     fib_frontend.o fib_semantics.o fib_trie.o fib_notifier.o \
+diff -rpuN -x '.*' linux-4.13.1-base/net/ipv4/sysctl_net_ipv4.c linux-4.13.1-pure-bbr/net/ipv4/sysctl_net_ipv4.c
+--- linux-4.13.1-base/net/ipv4/sysctl_net_ipv4.c	2017-09-10 01:45:52.000000000 -0400
++++ linux-4.13.1-pure-bbr/net/ipv4/sysctl_net_ipv4.c	2020-01-08 15:09:40.684785800 -0500
+@@ -661,15 +661,22 @@ static struct ctl_table ipv4_table[] = {
+ 		.extra1		= &zero,
+ 		.extra2		= &four,
+ 	},
+-	{
+-		.procname	= "tcp_min_tso_segs",
+-		.data		= &sysctl_tcp_min_tso_segs,
+-		.maxlen		= sizeof(int),
+-		.mode		= 0644,
+-		.proc_handler	= proc_dointvec_minmax,
+-		.extra1		= &one,
+-		.extra2		= &gso_max_segs,
+-	},
++	 {
++		 .procname   = "tcp_deepcc",
++		 .data       = &sysctl_tcp_deepcc_enable,
++		 .maxlen     = sizeof(int),
++		 .mode       = 0644,
++		 .proc_handler   = proc_dointvec
++	 },
++	/*C2TCP params */
++	 {
++		 .procname   = "tcp_c2tcp_enable",
++		 .data       = &sysctl_tcp_c2tcp_enable,
++		 .maxlen     = sizeof(int),
++		 .mode       = 0644,
++		 .proc_handler   = proc_dointvec
++	 },
++	 /* End of */
+ 	{
+ 		.procname	= "tcp_pacing_ss_ratio",
+ 		.data		= &sysctl_tcp_pacing_ss_ratio,
+@@ -710,6 +717,97 @@ static struct ctl_table ipv4_table[] = {
+ 		.mode		= 0444,
+ 		.proc_handler   = proc_tcp_available_ulp,
+ 	},
++	/*
++	* Custom bindings for SYSCTL BBR Params
++	*/
++	{
++		.procname	= "tcp_bbr_cwnd_rv_gain",
++		.data		= &sysctl_tcp_bbr_cwnd_rv_gain,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= proc_douintvec,
++	},
++	{
++		.procname	= "tcp_bbr_enable_maxdelay",
++		.data		= &sysctl_tcp_bbr_enable_maxdelay,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= proc_douintvec,
++	},
++
++	{
++		.procname	= "tcp_bbr_enable_probertt",
++		.data		= &sysctl_tcp_bbr_enable_probertt,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= proc_douintvec,
++	},
++	{
++		.procname	= "tcp_bbr_targetdelay",
++		.data		= &sysctl_tcp_bbr_targetdelay,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= proc_douintvec,
++	},
++	{
++		.procname	= "tcp_bbr_debug",
++		.data		= &sysctl_tcp_bbr_debug,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= proc_douintvec,
++	},
++	{
++			.procname	= "tcp_bbr_enable_app_limited",
++			.data		= &sysctl_tcp_bbr_enable_app_limited,
++			.maxlen		= sizeof(unsigned int),
++			.mode		= 0644,
++			.proc_handler	= proc_douintvec,
++	},
++	{
++			.procname	= "tcp_bbr_enable_lt_bw",
++			.data		= &sysctl_tcp_bbr_enable_lt_bw,
++			.maxlen		= sizeof(unsigned int),
++			.mode		= 0644,
++			.proc_handler	= proc_douintvec,
++	},
++	{
++			.procname	= "tcp_bbr_bw_auto",
++			.data		= &sysctl_tcp_bbr_bw_auto,
++			.maxlen		= sizeof(unsigned int),
++			.mode		= 0644,
++			.proc_handler	= proc_douintvec,
++	},
++	{
++		.procname	= "tcp_bbr_init_cwnd",
++		.data		= &sysctl_tcp_bbr_init_cwnd,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= proc_douintvec,
++	}
++	,{
++		.procname	= "tcp_bbr_bw",
++		.data		= &sysctl_tcp_bbr_bw,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= proc_douintvec,
++	},
++	{
++		.procname	= "tcp_bbr_minrttwinsec",
++		.data		= &sysctl_bbr_min_rtt_win_sec,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= proc_douintvec,
++	},
++	{
++		.procname	= "tcp_bbr_proberttmodems",
++		.data		= &sysctl_bbr_probe_rtt_mode_ms,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= proc_douintvec,
++	},
++	/*
++	* End of
++	*/
+ 	{
+ 		.procname	= "icmp_msgs_per_sec",
+ 		.data		= &sysctl_icmp_msgs_per_sec,
+diff -rpuN -x '.*' linux-4.13.1-base/net/ipv4/tcp.c linux-4.13.1-pure-bbr/net/ipv4/tcp.c
+--- linux-4.13.1-base/net/ipv4/tcp.c	2017-09-10 01:45:52.000000000 -0400
++++ linux-4.13.1-pure-bbr/net/ipv4/tcp.c	2020-07-28 14:52:14.454042900 -0400
+@@ -300,6 +300,49 @@ atomic_long_t tcp_memory_allocated;	/* C
+ EXPORT_SYMBOL(tcp_memory_allocated);
+ 
+ /*
++* SYSCTL BBR PARAMS
++*/
++/* Enable Auto BW PROBING*/
++unsigned int sysctl_tcp_bbr_init_cwnd __read_mostly = 4;
++EXPORT_SYMBOL(sysctl_tcp_bbr_init_cwnd);
++
++unsigned int sysctl_tcp_bbr_enable_app_limited __read_mostly = 1;
++EXPORT_SYMBOL(sysctl_tcp_bbr_enable_app_limited);
++
++unsigned int sysctl_tcp_bbr_enable_lt_bw __read_mostly = 1;
++EXPORT_SYMBOL(sysctl_tcp_bbr_enable_lt_bw);
++
++unsigned int sysctl_tcp_bbr_bw_auto __read_mostly = 1;
++EXPORT_SYMBOL(sysctl_tcp_bbr_bw_auto);
++/* SET BW MANUALLY (Kbps)*/
++unsigned int sysctl_tcp_bbr_bw __read_mostly = 2000; //2000kbps
++EXPORT_SYMBOL(sysctl_tcp_bbr_bw);
++/* CWND GAIN*/
++unsigned int sysctl_tcp_bbr_cwnd_rv_gain __read_mostly = 1;
++EXPORT_SYMBOL(sysctl_tcp_bbr_cwnd_rv_gain);
++/* TCP BBR Debug */
++unsigned int sysctl_tcp_bbr_debug __read_mostly = 0;
++EXPORT_SYMBOL(sysctl_tcp_bbr_debug);
++/* Target Delay Enable */
++unsigned int sysctl_tcp_bbr_enable_maxdelay __read_mostly = 0;
++EXPORT_SYMBOL(sysctl_tcp_bbr_enable_maxdelay);
++/* Enable/Disable Probe RTT */
++unsigned int sysctl_tcp_bbr_enable_probertt __read_mostly = 1;
++EXPORT_SYMBOL(sysctl_tcp_bbr_enable_probertt);
++/* Target Delay Capping the min RTT */
++unsigned int sysctl_tcp_bbr_targetdelay __read_mostly = 0;
++EXPORT_SYMBOL(sysctl_tcp_bbr_targetdelay);
++/* Window length of min_rtt filter (in sec): */
++unsigned int sysctl_bbr_min_rtt_win_sec __read_mostly = 10;
++EXPORT_SYMBOL(sysctl_bbr_min_rtt_win_sec);
++/* Minimum time (in ms) spent at bbr_cwnd_min_target in BBR_PROBE_RTT mode: */
++unsigned int sysctl_bbr_probe_rtt_mode_ms __read_mostly = 200;
++EXPORT_SYMBOL(sysctl_bbr_probe_rtt_mode_ms);
++/*
++* End of Custom and Modded Params
++*/
++
++/*
+  * Current number of TCP sockets.
+  */
+ struct percpu_counter tcp_sockets_allocated;
+@@ -424,6 +467,11 @@ void tcp_init_sock(struct sock *sk)
+ 	tp->snd_cwnd_clamp = ~0;
+ 	tp->mss_cache = TCP_MSS_DEFAULT;
+ 
++	/*
++	 * Orca Cwnd_coef init. to 1
++	 */
++	tp->cwnd_min = 1;
++
+ 	tp->reordering = sock_net(sk)->ipv4.sysctl_tcp_reordering;
+ 	tcp_assign_congestion_control(sk);
+ 
+@@ -604,6 +652,7 @@ int tcp_ioctl(struct sock *sk, int cmd,
+ 		else
+ 			answ = tp->write_seq - tp->snd_nxt;
+ 		break;
++
+ 	default:
+ 		return -ENOIOCTLCMD;
+ 	}
+@@ -2503,6 +2552,7 @@ static int do_tcp_setsockopt(struct sock
+ 		release_sock(sk);
+ 		return err;
+ 	}
++
+ 	default:
+ 		/* fallthru */
+ 		break;
+@@ -2766,6 +2816,116 @@ static int do_tcp_setsockopt(struct sock
+ 		tp->notsent_lowat = val;
+ 		sk->sk_write_space(sk);
+ 		break;
++	/*
++	 * Raw implementation of sockets.
++	 * Basically hacked the current code to set variables.
++	 * Complete rewrite and seperate socket implementation should be done.
++	*/
++	case TCP_BBR_EN_MAXDEL:
++		sysctl_tcp_bbr_enable_maxdelay = val;
++		break;
++	case TCP_BBR_EN_PRBRTT:
++		sysctl_tcp_bbr_enable_probertt = val;
++		break;
++	case TCP_BBR_TRGTDEL_US:
++		sysctl_tcp_bbr_targetdelay = val;
++		break;
++	case TCP_BBR_MINRTTWIN_SEC:
++		sysctl_bbr_min_rtt_win_sec = val;
++		break;
++	case TCP_BBR_PRBERTTMDE_MS:
++		sysctl_bbr_probe_rtt_mode_ms = val;
++		break;
++	case TCP_BBR_BWAUTO:
++		sysctl_tcp_bbr_bw_auto = val;
++		break;
++	case TCP_BBR_BWVAL:
++		sysctl_tcp_bbr_bw = val;
++		break;
++	case TCP_BBR_CWNDRVGAIN:
++		sysctl_tcp_bbr_cwnd_rv_gain = val;
++		break;
++	case TCP_BBR_DEBUG:
++		sysctl_tcp_bbr_debug = val;
++		if (icsk->icsk_ca_ops->update_by_app) {
++			icsk->icsk_ca_ops->update_by_app(sk);
++			tcp_push_pending_frames(sk);
++		}
++		break;
++	case TCP_CWND_CLAMP:
++		if(sysctl_tcp_bbr_init_cwnd<=val/tp->mss_cache)
++			tp->snd_cwnd_clamp = val/tp->mss_cache;
++		if (icsk->icsk_ca_ops->update_by_app) {
++			icsk->icsk_ca_ops->update_by_app(sk);
++			tcp_push_pending_frames(sk);
++		}
++		break;
++/*
++ * DeepCC
++ *
++ */
++	case TCP_DEEPCC_ENABLE:
++		tp->deepcc_enable = val;
++
++		break;
++
++	case TCP_CWND_CAP:
++		if(sysctl_tcp_bbr_init_cwnd<=val)
++		{
++			tp->snd_cwnd_clamp = val;
++			tp->snd_cwnd =min(tp->snd_cwnd,tp->snd_cwnd_clamp);
++			tcp_push_pending_frames(sk);
++		}
++		break;
++
++	case TCP_CWND:
++		if(sysctl_tcp_bbr_init_cwnd<=val)
++		{
++			tp->snd_cwnd =min(val,tp->snd_cwnd_clamp);
++		}
++		else
++		{
++			tp->snd_cwnd =min(sysctl_tcp_bbr_init_cwnd,tp->snd_cwnd_clamp);
++		}
++		if (icsk->icsk_ca_ops->update_by_app)
++		{
++			icsk->icsk_ca_ops->update_by_app(sk);
++		}
++		tcp_push_pending_frames(sk);
++		break;
++
++	case TCP_CWND_MIN:
++		if(sysctl_tcp_bbr_init_cwnd<=val)
++		{
++			tp->cwnd_min =val;
++		}
++		else
++		{
++			tp->cwnd_min =sysctl_tcp_bbr_init_cwnd;
++		}
++		tp->snd_cwnd =max(tp->cwnd_min,tp->snd_cwnd);
++		tp->snd_cwnd =min(tp->snd_cwnd,tp->snd_cwnd_clamp);
++		if (icsk->icsk_ca_ops->update_by_app)
++		{
++			icsk->icsk_ca_ops->update_by_app(sk);
++		}
++		tcp_push_pending_frames(sk);
++		break;
++
++//END
++
++/*C2TCP: PARAMETERS*/
++	case TCP_C2TCP_ENABLE:
++		if (icsk->icsk_ca_ops->enable_c2tcp)
++		{
++			icsk->icsk_ca_ops->enable_c2tcp(sk,val);
++		}
++		break;
++	case TCP_C2TCP_ALPHA:
++		tp->c2tcp_alpha = val;
++		break;
++//END
++
+ 	default:
+ 		err = -ENOPROTOOPT;
+ 		break;
+@@ -3026,6 +3186,27 @@ static int do_tcp_getsockopt(struct sock
+ 			return -EFAULT;
+ 		return 0;
+ 	}
++	case TCP_DEEPCC_INFO: {
++		const struct tcp_congestion_ops *ca_ops;
++		union tcp_cc_info info;
++		size_t sz = 0;
++		int attr;
++
++		if (get_user(len, optlen))
++			return -EFAULT;
++
++		if(!tp->deepcc_enable && !sysctl_tcp_deepcc_enable)
++			return -EFAULT;
++
++		sz = deepcc_get_info(sk, ~0U, &attr, &info);
++
++		len = min_t(unsigned int, len, sz);
++		if (put_user(len, optlen))
++			return -EFAULT;
++		if (copy_to_user(optval, &info, len))
++			return -EFAULT;
++		return 0;
++	}
+ 	case TCP_CC_INFO: {
+ 		const struct tcp_congestion_ops *ca_ops;
+ 		union tcp_cc_info info;
+@@ -3179,6 +3360,41 @@ static int do_tcp_getsockopt(struct sock
+ 		}
+ 		return 0;
+ 	}
++	/*
++         * Raw implementation of sockets.
++         * Basically hacked the current code to set variables.
++         * Complete rewrite and seperate socket implementation should be done.
++        */
++        case TCP_BBR_EN_MAXDEL:
++                val = sysctl_tcp_bbr_enable_maxdelay;
++                break;
++        case TCP_BBR_EN_PRBRTT:
++                val = sysctl_tcp_bbr_enable_probertt;
++                break;
++        case TCP_BBR_TRGTDEL_US:
++                val = sysctl_tcp_bbr_targetdelay;
++                break;
++        case TCP_BBR_MINRTTWIN_SEC:
++                val = sysctl_bbr_min_rtt_win_sec;
++                break;
++        case TCP_BBR_PRBERTTMDE_MS:
++                val = sysctl_bbr_probe_rtt_mode_ms;
++                break;
++        case TCP_BBR_BWAUTO:
++                val = sysctl_tcp_bbr_bw_auto;
++                break;
++        case TCP_BBR_BWVAL:
++                val = sysctl_tcp_bbr_bw;
++                break;
++        case TCP_BBR_CWNDRVGAIN:
++                val = sysctl_tcp_bbr_cwnd_rv_gain;
++                break;
++        case TCP_BBR_DEBUG:
++                val = sysctl_tcp_bbr_debug;
++                break;
++        /*
++         * End of custom implementation.
++	*/
+ 	default:
+ 		return -ENOPROTOOPT;
+ 	}
+diff -rpuN -x '.*' linux-4.13.1-base/net/ipv4/tcp_cong.c linux-4.13.1-pure-bbr/net/ipv4/tcp_cong.c
+--- linux-4.13.1-base/net/ipv4/tcp_cong.c	2017-09-10 01:45:52.000000000 -0400
++++ linux-4.13.1-pure-bbr/net/ipv4/tcp_cong.c	2020-01-08 15:09:40.753787200 -0500
+@@ -180,6 +180,9 @@ void tcp_init_congestion_control(struct
+ {
+ 	const struct inet_connection_sock *icsk = inet_csk(sk);
+ 
++	//DeepCC initialization
++	tcp_sk(sk)->deepcc_enable = 0;
++
+ 	tcp_sk(sk)->prior_ssthresh = 0;
+ 	if (icsk->icsk_ca_ops->init)
+ 		icsk->icsk_ca_ops->init(sk);
+diff -rpuN -x '.*' linux-4.13.1-base/net/ipv4/tcp_cubic.c linux-4.13.1-pure-bbr/net/ipv4/tcp_cubic.c
+--- linux-4.13.1-base/net/ipv4/tcp_cubic.c	2017-09-10 01:45:52.000000000 -0400
++++ linux-4.13.1-pure-bbr/net/ipv4/tcp_cubic.c	2020-07-28 14:40:37.313481900 -0400
+@@ -23,10 +23,39 @@
+  * this behaves the same as the original Reno.
+  */
+ 
++/**
++ * C2TCP:Cellular Controlled Delay TCP
++ * Home Page:
++ * 		https://wp.nyu.edu/c2tcp/
++ *
++ * This implementation is only a proof-of-concept.
++ * A more general version working with different TCP schemes will be released, when I get time! :)
++ * Here, C2TCP's functionality is implemented on top of TCP Cubic.
++ *
++ * Author: Soheil Abbasloo <ab.soheil@nyu.edu>
++ *
++ * C2TCP is described in detail in:
++ *  1- "C2TCP: A Flexible Cellular TCP to Meet Stringent Delay Requirements",
++ *  Soheil Abbasloo, et. al., IEEE JSAC'19
++ *
++ *	2- "Cellular Controlled Delay TCP (C2TCP)",
++ *	Soheil Abbasloo, et. al., in IFIP Networking Conference (IFIP Networking) 2018.
++ *
++ * C2TCP's Repository:
++ *		https://github.com/soheil-ab/c2tcp
++ *
++ * Copyright (C) 2019 Soheil Abbasloo <ab.soheil@nyu.edu>
++ */
++
+ #include <linux/mm.h>
+ #include <linux/module.h>
+ #include <linux/math64.h>
+ #include <net/tcp.h>
++#include <net/codel.h>
++#include <linux/inet_diag.h>
++
++#define THR_SCALE 24
++#define THR_UNIT (1 << THR_SCALE)
+ 
+ #define BICTCP_BETA_SCALE    1024	/* Scale factor beta calculation
+ 					 * max_cwnd = snd_cwnd * beta
+@@ -58,6 +87,13 @@ static u32 cube_rtt_scale __read_mostly;
+ static u32 beta_scale __read_mostly;
+ static u64 cube_factor __read_mostly;
+ 
++/*C2TCP: System Params*/
++#define TCP_C2TCP_X_SCALE 100
++#define TCP_C2TCP_ALPHA_INIT 200		//Initial Alpha = 3 (=TCP_C2TCP_ALPHA_INIT/TCP_C2TCP_X_SCALE)
++int sysctl_tcp_c2tcp_enable __read_mostly = 0;
++EXPORT_SYMBOL(sysctl_tcp_c2tcp_enable);
++/*End of*/
++
+ /* Note parameters that are used for precomputing scale factors are read-only */
+ module_param(fast_convergence, int, 0644);
+ MODULE_PARM_DESC(fast_convergence, "turn on/off fast convergence");
+@@ -102,6 +138,63 @@ struct bictcp {
+ 	u32	curr_rtt;	/* the minimum rtt of current round */
+ };
+ 
++
++static void Newton_step(struct sock * sk)
++{
++   struct tcp_sock *tp = tcp_sk(sk);
++   u32 invsqrt = ((u32)tp->rec_inv_sqrt) << REC_INV_SQRT_SHIFT;
++   u32 invsqrt2 = ((u64)invsqrt * invsqrt) >> 32;
++   u64 val = (3LL << 32) - ((u64)tp->cnt_rtt * invsqrt2);
++
++   val >>= 2; /* avoid overflow in following multiply */
++   val = (val * invsqrt) >> (32 - 2 + 1);
++
++   tp->rec_inv_sqrt = val >> REC_INV_SQRT_SHIFT;
++}
++
++static codel_time_t control_law(codel_time_t t,
++				      codel_time_t interval,
++				      u32 rec_inv_sqrt)
++{
++	return t + reciprocal_scale(interval, rec_inv_sqrt << REC_INV_SQRT_SHIFT);
++}
++
++
++static void c2tcp_reset(struct sock * sk)
++{
++   struct tcp_sock *tp = tcp_sk(sk);
++   tp->c2tcp_min_urtt=0;
++}
++static void init_c2tcp(struct sock * sk,int enable)
++{
++   struct tcp_sock *tp = tcp_sk(sk);
++   tp->c2tcp_enable=enable;
++
++   tp->first_above_time=0;
++   tp->cnt_rtt=1;
++   tp->c2tcp_min_urtt=0;
++   tp->c2tcp_cnt=0;
++   tp->c2tcp_avg_urtt=0;
++   tp->c2tcp_avg_thr=0;
++   tp->c2tcp_thr_cnt=0;
++   tp->c2tcp_alpha=TCP_C2TCP_ALPHA_INIT;
++}
++//End of
++
++/**
++ * DeepCC
++ */
++static void init_deepcc(struct sock * sk)
++{
++   struct tcp_sock *tp = tcp_sk(sk);
++   tp->deepcc_api.min_urtt=0;
++   tp->deepcc_api.cnt=0;
++   tp->deepcc_api.avg_urtt=0;
++   tp->deepcc_api.avg_thr=0;
++   tp->deepcc_api.thr_cnt=0;
++}
++//End of
++
+ static inline void bictcp_reset(struct bictcp *ca)
+ {
+ 	ca->cnt = 0;
+@@ -140,6 +233,7 @@ static inline void bictcp_hystart_reset(
+ static void bictcp_init(struct sock *sk)
+ {
+ 	struct bictcp *ca = inet_csk_ca(sk);
++	struct tcp_sock *tp = tcp_sk(sk);
+ 
+ 	bictcp_reset(ca);
+ 	ca->loss_cwnd = 0;
+@@ -149,8 +243,93 @@ static void bictcp_init(struct sock *sk)
+ 
+ 	if (!hystart && initial_ssthresh)
+ 		tcp_sk(sk)->snd_ssthresh = initial_ssthresh;
++
++	/*C2TCP*/
++	if (tp->c2tcp_enable || sysctl_tcp_c2tcp_enable)
++		init_c2tcp(sk,1);
++	else
++	{
++		tp->c2tcp_enable=0;
++	}
+ }
+ 
++/*C2TCP-Functionality */
++static void c2tcp_pkts_acked(struct sock *sk,u32 cnt,s32 rtt_us)
++{
++   const struct inet_connection_sock *icsk = inet_csk(sk);
++   struct tcp_sock *tp = tcp_sk(sk);
++
++   if(tp->c2tcp_min_urtt==0 || tp->c2tcp_min_urtt>rtt_us)
++		tp->c2tcp_min_urtt=rtt_us;
++   if(rtt_us>0)
++   {
++	   u64 tmp_avg=0;
++	   u64 tmp2_avg=0;
++		tmp_avg=(tp->c2tcp_cnt)*tp->c2tcp_avg_urtt+rtt_us;
++		tp->c2tcp_cnt++;
++		tmp2_avg=tp->c2tcp_cnt;
++		tmp2_avg=tmp_avg/tp->c2tcp_cnt;
++		tp->c2tcp_avg_urtt=(u32)(tmp2_avg);
++   }
++
++   u32 tmp,tmp2;
++   u32 tmp_min_msrtt=tp->c2tcp_min_urtt/USEC_PER_MSEC;
++   codel_time_t c2tcp_setpoint;
++   codel_time_t c2tcp_interval;
++   codel_time_t now=codel_get_time();
++   codel_time_t c2tcp_rtt=MS2TIME(rtt_us/USEC_PER_MSEC);
++   codel_time_t c2tcp_next_time=MS2TIME(tp->next_time/USEC_PER_MSEC);
++
++   tmp=(tmp_min_msrtt*tp->c2tcp_alpha)/TCP_C2TCP_X_SCALE;
++   c2tcp_setpoint=MS2TIME(tmp);
++   tmp2=(tmp_min_msrtt*tp->c2tcp_alpha)/TCP_C2TCP_X_SCALE;
++   c2tcp_interval=MS2TIME(tmp2);
++
++   if(codel_time_after_eq(c2tcp_setpoint,c2tcp_rtt))
++   {
++       tp->first_above_time=0;
++       tp->cnt_rtt=1;
++       //tp->first_time=0;
++//     bictcp_update(ca, tp->snd_cwnd);
++       tmp2=(rtt_us/USEC_PER_MSEC);
++       if (tmp2==0)
++           tmp2++;
++       tmp=(tmp)/(tmp2);
++
++       tp->snd_cwnd_cnt += tmp;
++       if (tp->snd_cwnd_cnt >= tp->snd_cwnd) {
++    	   u32 delta = tp->snd_cwnd_cnt / tp->snd_cwnd;
++    	   tp->snd_cwnd_cnt -= delta * tp->snd_cwnd;
++    	   tp->snd_cwnd += delta;
++           tp->snd_cwnd = min(tp->snd_cwnd, tp->snd_cwnd_clamp);
++       }
++  }
++  else if (tp->first_above_time==0)
++  {
++      tp->first_above_time=codel_time_to_us((now+c2tcp_interval));
++      tp->next_time=tp->first_above_time;
++       //tp->first_time=1;
++       tp->cnt_rtt=1;
++       tp->rec_inv_sqrt= ~0U >> REC_INV_SQRT_SHIFT;
++       Newton_step(sk);
++   }
++   else if (codel_time_after(now,c2tcp_next_time))
++   {
++       c2tcp_next_time=control_law(now,c2tcp_interval,tp->rec_inv_sqrt);
++
++       tp->next_time=codel_time_to_us(c2tcp_next_time);
++       tp->cnt_rtt++;
++       Newton_step(sk);
++
++       tp->prior_ssthresh = tcp_current_ssthresh(sk);
++       tp->snd_ssthresh = icsk->icsk_ca_ops->ssthresh(sk);
++       tp->snd_cwnd       = 1;
++       tp->snd_cwnd_cnt   = 0;
++//     printk(KERN_INFO "c2tcp triggerd! cnt:%d, changing ssthresh from %d to %d\n",tp->cnt_rtt-1,tp->prior_ssthresh,tp->snd_ssthresh);
++   }
++}
++/* End of ... */
++
+ static void bictcp_cwnd_event(struct sock *sk, enum tcp_ca_event event)
+ {
+ 	if (event == CA_EVENT_TX_START) {
+@@ -463,6 +642,76 @@ static void bictcp_acked(struct sock *sk
+ 	if (hystart && tcp_in_slow_start(tp) &&
+ 	    tp->snd_cwnd >= hystart_low_window)
+ 		hystart_update(sk, delay);
++
++	/* C2TCP Functionality */
++	 if (tp->c2tcp_enable || sysctl_tcp_c2tcp_enable)
++	     c2tcp_pkts_acked(sk, sample->pkts_acked, sample->rtt_us);
++}
++
++static void natcp_update_by_app(struct sock *sk)
++{
++	struct tcp_sock *tp = tcp_sk(sk);
++	printk("natcp_update_by_app:snd_cwnd:%d\cwnd_clamp:%d\n",
++			tp->snd_cwnd,tp->snd_cwnd_clamp);
++	tp->snd_cwnd =min(tp->snd_cwnd,tp->snd_cwnd_clamp);
++}
++
++static size_t c2tcp_get_info(struct sock *sk, u32 ext, int *attr,
++			   union tcp_cc_info *info)
++{
++	struct tcp_sock *tp = tcp_sk(sk);
++	if(tp->c2tcp_enable || sysctl_tcp_c2tcp_enable)
++	{
++		if (ext & (1 << (INET_DIAG_C2TCPINFO - 1)) ) {
++			memset(&info->c2tcp, 0, sizeof(info->c2tcp));
++			info->c2tcp.c2tcp_avg_urtt		= tp->c2tcp_avg_urtt;
++			info->c2tcp.c2tcp_min_rtt		= tp->c2tcp_min_urtt;
++			info->c2tcp.c2tcp_cnt			= tp->c2tcp_cnt;
++			info->c2tcp.c2tcp_avg_thr		= tp->c2tcp_avg_thr * tp->mss_cache * USEC_PER_SEC >> THR_SCALE;
++			info->c2tcp.c2tcp_thr_cnt		= tp->c2tcp_thr_cnt;
++			*attr = INET_DIAG_C2TCPINFO;
++			tp->c2tcp_cnt=0;
++			tp->c2tcp_avg_urtt=0;
++			tp->c2tcp_thr_cnt=0;
++			tp->c2tcp_avg_thr=0;
++			return sizeof(info->c2tcp);
++		}
++	}
++
++	return 0;
++}
++
++/* Estimate the bandwidth based on how fast packets are delivered */
++static void c2tcp_get_rate_sample(struct sock *sk, const struct rate_sample *rs)
++{
++	struct tcp_sock *tp = tcp_sk(sk);
++	u64 bw;
++	if (rs->delivered < 0 || rs->interval_us <= 0)
++		return; /* Not a valid observation */
++
++	/* Divide delivered by the interval to find a (lower bound) bottleneck
++	 * bandwidth sample. Delivered is in packets and interval_us in uS and
++	 * ratio will be <<1 for most connections. So delivered is first scaled.
++	 */
++	bw = (u64)rs->delivered * THR_UNIT;
++	do_div(bw, rs->interval_us);
++	tp->c2tcp_avg_thr=tp->c2tcp_avg_thr*tp->c2tcp_thr_cnt+bw;
++	tp->c2tcp_thr_cnt=tp->c2tcp_thr_cnt+1;
++	do_div(tp->c2tcp_avg_thr,tp->c2tcp_thr_cnt);
++}
++
++static void get_rate_sample(struct sock *sk, const struct rate_sample *rs)
++{
++	struct tcp_sock *tp = tcp_sk(sk);
++	if(tp->c2tcp_enable || sysctl_tcp_c2tcp_enable)
++		c2tcp_get_rate_sample(sk,rs);
++}
++//End
++
++static void enable_c2tcp(struct sock *sk,int val)
++{
++	struct tcp_sock *tp = tcp_sk(sk);
++	init_c2tcp(sk,val);
+ }
+ 
+ static struct tcp_congestion_ops cubictcp __read_mostly = {
+@@ -472,8 +721,13 @@ static struct tcp_congestion_ops cubictc
+ 	.set_state	= bictcp_state,
+ 	.undo_cwnd	= bictcp_undo_cwnd,
+ 	.cwnd_event	= bictcp_cwnd_event,
++	//S.A: To support NATCP
++	.update_by_app	= natcp_update_by_app,
++	.get_rate_sample = get_rate_sample,
+ 	.pkts_acked     = bictcp_acked,
+ 	.owner		= THIS_MODULE,
++	.get_info	= c2tcp_get_info,
++	.enable_c2tcp = enable_c2tcp,
+ 	.name		= "cubic",
+ };
+ 
+diff -rpuN -x '.*' linux-4.13.1-base/net/ipv4/tcp_deepcc.c linux-4.13.1-pure-bbr/net/ipv4/tcp_deepcc.c
+--- linux-4.13.1-base/net/ipv4/tcp_deepcc.c	1969-12-31 19:00:00.000000000 -0500
++++ linux-4.13.1-pure-bbr/net/ipv4/tcp_deepcc.c	2020-07-28 14:31:43.256273000 -0400
+@@ -0,0 +1,136 @@
++/* Monitoring and Action Enforcer Blocks of DeepCC and Orca
++ *
++ * Author: Soheil Abbasloo <ab.soheil@nyu.edu>
++ *
++ * Generating useful states/information to be used by the Deep Reinforcement Learning Block.
++ *
++ * Orca is described in detail in:
++ *   "Classic Meets Modern: A Pragmatic Learning-Based Congestion Control for the Internet",
++ *   Soheil Abbasloo, Chen-Yu Yen, H. J. Chao. In Proc ACM SIGCOMM'20
++ *
++ * Orca's Repository:
++ *		https://github.com/soheil-ab/orca
++ *
++ * Copyright (C) 2020 Soheil Abbasloo <ab.soheil@nyu.edu>
++ */
++
++#include <net/tcp.h>
++#include <linux/inet_diag.h>
++
++/*
++ * Samplings required for DeepCC/Orca
++ */
++
++#define THR_SCALE_DEEPCC 24
++#define THR_UNIT_DEEPCC (1 << THR_SCALE_DEEPCC)
++
++void deepcc_init(struct sock * sk)
++{
++   struct tcp_sock *tp = tcp_sk(sk);
++   tp->deepcc_api.min_urtt=0;
++   tp->deepcc_api.cnt=0;
++   tp->deepcc_api.avg_urtt=0;
++   tp->deepcc_api.avg_thr=0;
++   tp->deepcc_api.thr_cnt=0;
++   tp->deepcc_api.pre_lost=0;
++}
++
++size_t deepcc_get_info(struct sock *sk, u32 ext, int *attr,union tcp_cc_info *info)
++{
++	if (ext & (1 << (INET_DIAG_DEEPCCINFO - 1)) ) {
++		struct tcp_sock *tp = tcp_sk(sk);
++		memset(&info->deepcc, 0, sizeof(info->deepcc));
++		info->deepcc.avg_urtt		= tp->deepcc_api.avg_urtt;
++		info->deepcc.min_rtt		= tp->deepcc_api.min_urtt;
++		info->deepcc.cnt			= tp->deepcc_api.cnt;
++		info->deepcc.avg_thr		= tp->deepcc_api.avg_thr * tp->mss_cache * USEC_PER_SEC >> THR_SCALE_DEEPCC;
++		info->deepcc.thr_cnt		= tp->deepcc_api.thr_cnt;
++		info->deepcc.cwnd			= tp->snd_cwnd;
++		info->deepcc.pacing_rate	= sk->sk_pacing_rate;
++		info->deepcc.lost_bytes		= (tp->lost - tp->deepcc_api.pre_lost)* tp->mss_cache;
++		info->deepcc.srtt_us		= tp->srtt_us;				/* smoothed round trip time << 3 in usecs */
++		info->deepcc.snd_ssthresh	= tp->snd_ssthresh;			/* Slow start size threshold		*/
++		info->deepcc.packets_out	= tp->packets_out;			/* Packets which are "in flight"	*/
++		info->deepcc.retrans_out	= tp->retrans_out;			/* Retransmitted packets out		*/
++		info->deepcc.max_packets_out= tp->max_packets_out;  	/* max packets_out in last window */
++		info->deepcc.mss_cache		= tp->mss_cache;		  	/* max packets_out in last window */
++
++		*attr = INET_DIAG_DEEPCCINFO;
++		tp->deepcc_api.cnt=0;
++		tp->deepcc_api.avg_urtt=0;
++		tp->deepcc_api.thr_cnt=0;
++		tp->deepcc_api.avg_thr=0;
++		tp->deepcc_api.pre_lost=tp->lost;
++
++		return sizeof(info->deepcc);
++	}
++	return 0;
++}
++
++void deepcc_update_pacing_rate(struct sock *sk)
++{
++	const struct tcp_sock *tp = tcp_sk(sk);
++	u64 rate;
++	cmpxchg(&sk->sk_pacing_status, SK_PACING_NONE, SK_PACING_NEEDED);
++
++	rate = tcp_mss_to_mtu(sk, tcp_sk(sk)->mss_cache); //
++
++	rate *= USEC_PER_SEC;
++
++	rate *= max(tp->snd_cwnd, tp->packets_out);
++
++	if (likely(tp->srtt_us>>3))
++		do_div(rate, tp->srtt_us>>3);
++
++	/* ACCESS_ONCE() is needed because sch_fq fetches sk_pacing_rate
++	 * without any lock. We want to make sure compiler wont store
++	 * intermediate values in this location.
++	 */
++	ACCESS_ONCE(sk->sk_pacing_rate) = min_t(u64, rate,sk->sk_max_pacing_rate);
++}
++
++void deepcc_update_cwnd(struct sock *sk)
++{
++	struct tcp_sock *tp = tcp_sk(sk);
++	tp->snd_cwnd = max(tp->snd_cwnd,tp->cwnd_min);
++	tp->snd_cwnd =min(tp->snd_cwnd,tp->snd_cwnd_clamp);
++	if(tp->deepcc_enable>1)
++		deepcc_update_pacing_rate(sk);
++}
++
++void deepcc_get_rate_sample(struct sock *sk, const struct rate_sample *rs)
++{
++	struct tcp_sock *tp = tcp_sk(sk);
++	u64 bw;
++	if (rs->delivered < 0 || rs->interval_us <= 0)
++		return; /* Not a valid observation */
++
++	bw = (u64)rs->delivered * THR_UNIT_DEEPCC;
++	do_div(bw, rs->interval_us);
++	tp->deepcc_api.avg_thr=tp->deepcc_api.avg_thr*tp->deepcc_api.thr_cnt+bw;
++	tp->deepcc_api.thr_cnt=tp->deepcc_api.thr_cnt+1;
++	do_div(tp->deepcc_api.avg_thr,tp->deepcc_api.thr_cnt);
++}
++
++void deepcc_pkts_acked(struct sock *sk, const struct ack_sample *sample)
++{
++	struct tcp_sock *tp = tcp_sk(sk);
++
++	/* Some calls are for duplicates without timetamps */
++	if (sample->rtt_us < 0)
++		return;
++
++	if(tp->deepcc_api.min_urtt==0 || tp->deepcc_api.min_urtt>sample->rtt_us)
++			tp->deepcc_api.min_urtt=sample->rtt_us;
++	if(sample->rtt_us>0)
++	{
++		u64 tmp_avg=0;
++		u64 tmp2_avg=0;
++		tmp_avg=(tp->deepcc_api.cnt)*tp->deepcc_api.avg_urtt+sample->rtt_us;
++		tp->deepcc_api.cnt++;
++		tmp2_avg=tp->deepcc_api.cnt;
++		tmp2_avg=tmp_avg/tp->deepcc_api.cnt;
++		tp->deepcc_api.avg_urtt=(u32)(tmp2_avg);
++	}
++}
++//END
+diff -rpuN -x '.*' linux-4.13.1-base/net/ipv4/tcp_fastopen.c linux-4.13.1-pure-bbr/net/ipv4/tcp_fastopen.c
+--- linux-4.13.1-base/net/ipv4/tcp_fastopen.c	2017-09-10 01:45:52.000000000 -0400
++++ linux-4.13.1-pure-bbr/net/ipv4/tcp_fastopen.c	2020-01-08 15:09:40.785050700 -0500
+@@ -218,6 +218,9 @@ static struct sock *tcp_fastopen_create_
+ 
+ 	/* Now finish processing the fastopen child socket. */
+ 	inet_csk(child)->icsk_af_ops->rebuild_header(child);
++	/*DeepCC Initialization*/
++	deepcc_init(sk);
++
+ 	tcp_init_congestion_control(child);
+ 	tcp_mtup_init(child);
+ 	tcp_init_metrics(child);
+diff -rpuN -x '.*' linux-4.13.1-base/net/ipv4/tcp_input.c linux-4.13.1-pure-bbr/net/ipv4/tcp_input.c
+--- linux-4.13.1-base/net/ipv4/tcp_input.c	2017-09-10 01:45:52.000000000 -0400
++++ linux-4.13.1-pure-bbr/net/ipv4/tcp_input.c	2020-01-08 15:09:40.800676200 -0500
+@@ -76,6 +76,10 @@
+ #include <asm/unaligned.h>
+ #include <linux/errqueue.h>
+ 
++
++int sysctl_tcp_deepcc_enable __read_mostly = 0;
++EXPORT_SYMBOL(sysctl_tcp_deepcc_enable);
++
+ int sysctl_tcp_fack __read_mostly;
+ int sysctl_tcp_max_reordering __read_mostly = 300;
+ int sysctl_tcp_dsack __read_mostly = 1;
+@@ -3215,14 +3219,25 @@ static int tcp_clean_rtx_queue(struct so
+ 		flag |= FLAG_SET_XMIT_TIMER;  /* set TLP or RTO timer */
+ 	}
+ 
+-	if (icsk->icsk_ca_ops->pkts_acked) {
++
++	//DeepCC sampling: Some schemes such as BBR does not have ->pkt_acked function!
++	// So let's don't use next if{} ;)
++	if(tp->deepcc_enable || sysctl_tcp_deepcc_enable)
++	{
+ 		struct ack_sample sample = { .pkts_acked = pkts_acked,
+ 					     .rtt_us = sack->rate->rtt_us,
+ 					     .in_flight = last_in_flight };
++		deepcc_pkts_acked(sk,&sample);
++	}
+ 
++	if (icsk->icsk_ca_ops->pkts_acked) {
++		struct ack_sample sample = { .pkts_acked = pkts_acked,
++					     .rtt_us = sack->rate->rtt_us,
++					     .in_flight = last_in_flight };
+ 		icsk->icsk_ca_ops->pkts_acked(sk, &sample);
+ 	}
+ 
++
+ #if FASTRETRANS_DEBUG > 0
+ 	WARN_ON((int)tp->sacked_out < 0);
+ 	WARN_ON((int)tp->lost_out < 0);
+@@ -3301,6 +3316,18 @@ static void tcp_cong_control(struct sock
+ 			     int flag, const struct rate_sample *rs)
+ {
+ 	const struct inet_connection_sock *icsk = inet_csk(sk);
++	struct tcp_sock *tp = tcp_sk(sk);
++
++	/*DeepCC: Update Throughput samples*/
++	if(tp->deepcc_enable || sysctl_tcp_deepcc_enable)
++		deepcc_get_rate_sample(sk,rs);
++	//END
++
++	//C2TCP:
++	if (icsk->icsk_ca_ops->get_rate_sample) {
++		icsk->icsk_ca_ops->get_rate_sample(sk,rs);
++	}
++	//End
+ 
+ 	if (icsk->icsk_ca_ops->cong_control) {
+ 		icsk->icsk_ca_ops->cong_control(sk, rs);
+@@ -3314,6 +3341,14 @@ static void tcp_cong_control(struct sock
+ 		/* Advance cwnd if state allows */
+ 		tcp_cong_avoid(sk, ack, acked_sacked);
+ 	}
++
++	/*Time to apply the DRL-Agent's action*/
++	if(tp->deepcc_enable || sysctl_tcp_deepcc_enable)
++	{
++		deepcc_update_cwnd(sk);
++		return;
++	}
++
+ 	tcp_update_pacing_rate(sk);
+ }
+ 
+@@ -5575,6 +5610,8 @@ void tcp_finish_connect(struct sock *sk,
+ 
+ 	tcp_init_metrics(sk);
+ 	tcp_call_bpf(sk, BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB);
++	/*DeepCC Initialization*/
++	deepcc_init(sk);
+ 	tcp_init_congestion_control(sk);
+ 
+ 	/* Prevent spurious tcp_cwnd_restart() on first data
+@@ -5981,6 +6018,8 @@ int tcp_rcv_state_process(struct sock *s
+ 			/* Make sure socket is routed, for correct metrics. */
+ 			icsk->icsk_af_ops->rebuild_header(sk);
+ 			tcp_call_bpf(sk, BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB);
++			/*DeepCC Initialization*/
++			deepcc_init(sk);
+ 			tcp_init_congestion_control(sk);
+ 
+ 			tcp_mtup_init(sk);
