@@ -54,7 +54,7 @@ To deactivate venv
 (venv) $ deactivate
 ```
 
-### Patching Orca Kernel: Install the prepared debian packages.
+### Patching Orca's Kernel: Install the prepared debian packages.
 
 ```
 cd linux
@@ -62,7 +62,13 @@ sudo dpkg -i linux-image*
 sudo dpkg -i linux-header*
 sudo reboot 
 ```
- 
+
+### Patching Orca's Kernel: Compile the Kernel source code.
+
+Another option is to compile your own kernel using the provided patch. You can use the instructions provided here to do that: https://github.com/Soheil-ab/C2TCP-IFIP/
+
+The source code is available in linux folder (https://github.com/Soheil-ab/Orca/blob/master/linux/linux-4-13-1-orca-0521%2Bc2tcp.patch)
+
 ### Verify the new kernel
 Use the following command to make sure that new kernel is installed:
 
