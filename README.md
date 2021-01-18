@@ -2,7 +2,7 @@
 
 This release presents the source code and materials used for the experiments in our SIGCOMM'20 paper: "Classic Meets Modern: A Pragmatic Learning-Based Congestion Control for the Internet" (https://dl.acm.org/doi/abs/10.1145/3387514.3405892).
 
-For the source code of our DeepCC plug-in reported in our IEEE JSAC'21 paper: "Wanna Make Your TCP Scheme Great for Cellular Networks? Let Machines Do It for You!", please checkout https://github.com/Soheil-ab/DeepCC.v1.0/ (The paper can be access here: https://ieeexplore.ieee.org/document/9252929)
+For the source code of our DeepCC plug-in reported in our IEEE JSAC'21 paper: "Wanna Make Your TCP Scheme Great for Cellular Networks? Let Machines Do It for You!", please checkout https://github.com/Soheil-ab/DeepCC.v1.0/ (The paper can be accessed here: https://ieeexplore.ieee.org/document/9252929)
 
 Installation Guide
 ==================
